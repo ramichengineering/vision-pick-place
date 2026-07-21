@@ -32,6 +32,13 @@ edot: error vel
 This is what I want
 ζ > 1 (overdamped): no overshoot but sluggish, crawls to target. Too much kd.
 
+Practical tuning loop:
+
+Start with modest kp, kd near critical.
+Too sluggish / big steady error → raise kp.
+Oscillating / overshooting → raise kd (or lower kp).
+Buzzing/unstable at the wrist → lower those joints' gains.
+
 I remember this from my EE classes. 
 
 ## Writing PD controller:
