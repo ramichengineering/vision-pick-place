@@ -40,3 +40,5 @@ The Menagerie Panda ships with position-servo actuators (MuJoCo's built-in PD).
 only feedback loop on the arm is ours: `tau = kp·(q_des − q) − kd·q̇`, plus
 optional gravity compensation (`data.qfrc_bias`). Gains live in
 `pd_controller.py` — tune them and feel the difference.
+
+
