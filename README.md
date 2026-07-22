@@ -9,15 +9,6 @@ Vision-guided pick and place with a simulated Franka Panda arm in MuJoCo.
   Jacobians): give a Cartesian target, solve for joint angles, drive there
   with the PD controller. *(current)*
 
-## Setup
-```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows;  source .venv/bin/activate on macOS/Linux
-pip install -r requirements.txt
-```
-The Panda model lives in `models/franka_emika_panda/` (from
-[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)).
-
 ## Run
 ```bash
 python src/sim.py                    # interactive viewer, holds the home pose
@@ -43,12 +34,5 @@ python src/reach_point.py --pos 0.5 0.2 0.4 --headless    # verify without a win
 | `src/ik.py` | Damped-least-squares IK solver (MuJoCo Jacobians) |
 | `src/reach_point.py` | Cartesian target -> IK -> PD drive, with target marker |
 | `src/inspect_model.py` | Print joints / actuators / dimensions |
-
-## Control notes
-The Menagerie Panda ships with position-servo actuators (MuJoCo's built-in PD).
-`load_panda()` rewrites the 7 arm actuators into fixed-gain torque motors so the
-only feedback loop on the arm is ours: `tau = kp·(q_des − q) − kd·q̇`, plus
-optional gravity compensation (`data.qfrc_bias`). Gains live in
-`pd_controller.py` — tune them and feel the difference.
 
 
