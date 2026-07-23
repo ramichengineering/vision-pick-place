@@ -17,7 +17,10 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "franka_emika_panda" / "scene.xml"
+_MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "franka_emika_panda"
+MODEL_PATH = _MODEL_DIR / "scene.xml"
+# Perception scene (Days 5-6): adds a red cube and two cameras.
+PICK_SCENE_PATH = _MODEL_DIR / "pick_scene.xml"
 
 # The Panda arm is joints 0-6; joints 7-8 are the two gripper fingers.
 ARM_DOF = 7
@@ -43,12 +46,23 @@ def load_panda(model_path: Path = MODEL_PATH):
     return model, data
 
 
-def home_qpos(model) -> np.ndarray:
-    """Joint positions from the model's 'home' keyframe (all 9 joints)."""
-    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
-    return model.key_qpos[key_id].copy()
+def _key_id(model, name):
+    """Prefer the requested keyframe; fall back to whatever exists."""
+    kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, name)
+    if kid < 0:
+        kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    return kid
 
 
-def reset_to_home(model, data) -> None:
-    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
-    mujoco.mj_resetDataKeyframe(model, data, key_id)
+def home_qpos(model, key="home") -> np.ndarray:
+    """Joint positions from the named keyframe (full nq)."""
+    return model.key_qpos[_key_id(model, key)].copy()
+
+
+def reset_to_home(model, data, key="home") -> None:
+    mujoco.mj_resetDataKeyframe(model, data, _key_id(model, key))
+
+
+def load_pick_scene():
+    """Panda + red cube + cameras, arm under torque control."""
+    return load_panda(PICK_SCENE_PATH)
