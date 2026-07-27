@@ -10,7 +10,10 @@ Vision-guided pick and place with a simulated Franka Panda arm in MuJoCo.
   with the PD controller. *(done)*
 - **Days 5–6 — Perception.** Camera in the scene, red cube segmented by colour,
   back-projected through the depth buffer to a world coordinate, then reached
-  by the arm using vision alone. *(current)*
+  by the arm using vision alone. *(done)*
+- **Days 7–8 — Full pick and place.** State machine chaining approach → descend
+  → grasp → lift → transport → release, with minimum-jerk trajectories between
+  waypoints. 12/12 randomized trials land the cube in the bin. *(current)*
 
 ## Run
 ```bash
@@ -31,7 +34,13 @@ python src/perception_test.py        # vision vs ground truth across placements
 python src/see_and_reach.py          # SEE the cube, then reach it (viewer)
 python src/see_and_reach.py --random --headless   # randomized, scored
 python src/debug_render.py           # dump what each camera sees
+
+# Days 7-8 — Full pick and place
+python src/pick_place.py                        # watch the whole sequence
+python src/pick_place.py --headless             # run and score one attempt
+python src/pick_place.py --trials 12 --headless # reliability check
 ```
+Reliable cube placements: `x` 0.30–0.80 m, `y` −0.25 to +0.45 m.
 
 ## Layout
 | File | Purpose |
@@ -45,7 +54,9 @@ python src/debug_render.py           # dump what each camera sees
 | `src/perception.py` | Colour segmentation + depth back-projection -> world xyz |
 | `src/perception_test.py` | Scores vision estimates against ground truth |
 | `src/see_and_reach.py` | Full loop: see the cube -> IK -> reach it |
+| `src/pick_place.py` | Pick-and-place state machine (perception + IK + PD) |
 | `src/debug_render.py` | Save RGB/mask PNGs from each camera |
 | `src/inspect_model.py` | Print joints / actuators / dimensions |
+| `src/inspect_gripper.py` | Measure fingertip geometry and the true grasp point |
 
 
