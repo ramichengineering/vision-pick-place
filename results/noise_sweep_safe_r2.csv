@@ -1,0 +1,9 @@
+vision_noise_mm,successes,trials,success_rate_pct,zone,retries_allowed
+0,12,12,100.0,safe,2
+5,12,12,100.0,safe,2
+10,12,12,100.0,safe,2
+15,12,12,100.0,safe,2
+20,11,12,91.7,safe,2
+25,9,12,75.0,safe,2
+30,8,12,66.7,safe,2
+40,5,12,41.7,safe,2

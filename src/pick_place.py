@@ -54,6 +54,21 @@ BIN_HOVER_H = 0.22    # travel height over the bin
 BIN_RELEASE_H = 0.10  # TCP height above the bin floor when letting go
 
 
+# Trial outcomes. SUCCESS plus one label per way the attempt can fail, so a
+# benchmark can report *why* things went wrong instead of just a pass rate.
+SUCCESS = "success"
+NOT_DETECTED = "not_detected"      # perception found no usable cube
+IK_FAILED = "ik_failed"            # a waypoint was unreachable
+GRASP_FAILED = "grasp_failed"      # gripper closed on nothing; cube never lifted
+DROPPED = "dropped"                # cube left the gripper mid-transport
+MISSED_BIN = "missed_bin"          # carried and released, but not into the bin
+
+# Cube-centre to TCP distance beyond which we consider the cube not held.
+# When grasped the two coincide within a few mm; a failed grasp leaves the cube
+# on the floor while the TCP climbs ~0.18 m, so the separation is unambiguous.
+HOLD_TOL = 0.045
+
+
 @dataclass
 class Phase:
     name: str
@@ -61,6 +76,7 @@ class Phase:
     grip: float
     move_time: float              # seconds easing toward the goal
     hold_time: float              # seconds settling once there
+    hold_required: bool = False   # abort the attempt if the cube leaves the gripper
 
 
 def minimum_jerk(s: float) -> float:
@@ -93,9 +109,9 @@ def build_phases(cube_xyz, bin_xyz) -> list[Phase]:
         Phase("APPROACH",  np.array([cx, cy, cz + APPROACH_H]), GRIP_OPEN,   2.0, 0.4),
         Phase("DESCEND",   np.array([cx, cy, cz]),              GRIP_OPEN,   1.6, 0.4),
         Phase("CLOSE",     np.array([cx, cy, cz]),              GRIP_CLOSED, 0.1, 1.0),
-        Phase("LIFT",      np.array([cx, cy, cz + LIFT_H]),     GRIP_CLOSED, 1.6, 0.3),
-        Phase("TRANSPORT", np.array([bx, by, BIN_HOVER_H]),     GRIP_CLOSED, 2.5, 0.4),
-        Phase("LOWER",     np.array([bx, by, BIN_RELEASE_H]),   GRIP_CLOSED, 1.2, 0.3),
+        Phase("LIFT",      np.array([cx, cy, cz + LIFT_H]),     GRIP_CLOSED, 1.6, 0.3, True),
+        Phase("TRANSPORT", np.array([bx, by, BIN_HOVER_H]),     GRIP_CLOSED, 2.5, 0.4, True),
+        Phase("LOWER",     np.array([bx, by, BIN_RELEASE_H]),   GRIP_CLOSED, 1.2, 0.3, True),
         Phase("RELEASE",   np.array([bx, by, BIN_RELEASE_H]),   GRIP_OPEN,   0.1, 0.8),
         Phase("RETREAT",   np.array([bx, by, BIN_HOVER_H]),     GRIP_OPEN,   1.2, 0.3),
     ]
@@ -117,17 +133,19 @@ class PickPlace:
         self.q_goal = self.q_start.copy()
         self.t0 = 0.0
         self.failed_ik = []
+        self.abort = None          # set to an outcome label if the attempt fails
+        self.abort_phase = None
         self._advance()
 
     def _solve(self, goal_pos):
-        """IK from the current arm pose; falls back to holding on failure."""
+        """IK from the current arm pose. Returns None if the goal is unreachable."""
         q_init = self.data.qpos.copy()
         res = self.solver.solve(goal_pos, target_quat=self.quat, q_init=q_init)
         if not res.success:
             self.failed_ik.append(self.phases[self.idx].name)
             if self.verbose:
-                print(f"    WARNING: IK failed ({res.pos_err*1000:.1f} mm) -- holding")
-            return self.q_goal.copy()
+                print(f"    IK failed ({res.pos_err*1000:.1f} mm) -- unreachable")
+            return None
         return res.q[:ARM_DOF]
 
     def _advance(self) -> bool:
@@ -137,7 +155,18 @@ class PickPlace:
             return False
         ph = self.phases[self.idx]
         self.q_start = self.data.qpos[ARM].copy()
-        self.q_goal = self.q_start.copy() if ph.goal_pos is None else self._solve(ph.goal_pos)
+        if ph.goal_pos is None:
+            self.q_goal = self.q_start.copy()
+        else:
+            solved = self._solve(ph.goal_pos)
+            if solved is None:
+                # Unreachable waypoint: abort instead of pressing on from a pose
+                # that was never planned. Reported, not silently absorbed.
+                self.abort = IK_FAILED
+                self.abort_phase = ph.name
+                self.idx = len(self.phases)
+                return False
+            self.q_goal = solved
         self.t0 = self.data.time
         if self.verbose:
             tgt = "hold" if ph.goal_pos is None else np.array2string(ph.goal_pos, precision=3)
@@ -163,6 +192,17 @@ class PickPlace:
         self.data.ctrl[ARM] = self.pd(self.model, self.data, q_des)
         self.data.ctrl[GRIPPER_CTRL] = ph.grip
         mujoco.mj_step(self.model, self.data)
+
+        # Bail out the moment the payload is lost, rather than solemnly carrying
+        # an empty gripper to the bin and calling it a miss.
+        if ph.hold_required and not holding_cube(self.model, self.data):
+            self.abort = GRASP_FAILED if ph.name == "LIFT" else DROPPED
+            self.abort_phase = ph.name
+            if self.verbose:
+                print(f"    [{self.data.time:5.2f}s] ABORT during {ph.name}: "
+                      f"{self.abort}")
+            self.idx = len(self.phases)      # stop the sequence
+            return
 
         if elapsed >= ph.move_time + ph.hold_time:
             self._advance()
@@ -191,49 +231,129 @@ def in_bin(model, data) -> tuple[bool, float]:
     return bool(dxy < 0.074 and 0.0 < c[2] < 0.10), dxy
 
 
-def run_trial(model, data, cube_xyz, camera="scene_cam", verbose=True, viewer=None):
-    reset_to_home(model, data, key="pick_home")
-    set_cube_pose(model, data, cube_xyz)
+def holding_cube(model, data, tol=HOLD_TOL) -> bool:
+    """Is the cube actually in the gripper? Compares cube centre to the TCP."""
+    tcp, _ = tcp_from_data(model, data)
+    return bool(np.linalg.norm(cube_pos(model, data) - tcp) < tol)
 
-    # --- PERCEPTION: locate the cube from the camera alone ---
+
+def cube_qpos_adr(model):
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "cube_free")
+    return model.jnt_qposadr[jid]
+
+
+def reset_arm_keep_cube(model, data):
+    """Return the arm to home without teleporting the cube back.
+
+    Needed for retries: after a failed grasp the cube has usually been nudged, and
+    the whole point of re-perceiving is to find where it *actually* ended up.
+    """
+    adr = cube_qpos_adr(model)
+    cube_state = data.qpos[adr:adr + 7].copy()
+    reset_to_home(model, data, key="pick_home")
+    data.qpos[adr:adr + 7] = cube_state
+    data.qvel[:] = 0
+    mujoco.mj_forward(model, data)
+
+
+@dataclass
+class TrialResult:
+    success: bool
+    outcome: str
+    attempts: int
+    vision_err_mm: float | None
+    cube_start: np.ndarray
+    cube_end: np.ndarray
+    bin_dist_mm: float | None
+    sim_time: float
+    abort_phase: str | None
+
+
+# Failures worth another go: in each case the cube is loose somewhere on the
+# floor, so re-perceiving and re-planning is a genuine recovery. NOT_DETECTED and
+# IK_FAILED are not retried -- nothing has changed, so the retry would be
+# identical.
+RETRYABLE = (GRASP_FAILED, DROPPED, MISSED_BIN)
+
+
+def single_attempt(model, data, camera="scene_cam", vision_noise_mm=0.0, rng=None,
+                   verbose=True, viewer=None):
+    """One attempt, starting from wherever the cube currently is.
+
+    Returns (outcome, vision_err_mm, abort_phase).
+    """
     det = estimate_cube(model, data, camera=camera)
     if not det.found:
         if verbose:
-            print(f"  cube not detected ({det.n_pixels} px)")
-        return False, None
+            print(f"    cube not detected ({det.n_pixels} red px)")
+        return NOT_DETECTED, None, None
+
     truth = cube_pos(model, data)
-    vis_err = np.linalg.norm(det.position - truth) * 1000
+    vis_err = float(np.linalg.norm(det.position - truth) * 1000)
+
+    # Optional synthetic perception error, to measure how much the grasp tolerates.
+    target = det.position.copy()
+    if vision_noise_mm > 0:
+        rng = rng or np.random.default_rng()
+        target = target + rng.normal(0.0, vision_noise_mm / 1000.0, 3)
+
     if verbose:
-        print(f"  [vision] cube at {np.array2string(det.position, precision=4)} "
+        print(f"    [vision] {np.array2string(det.position, precision=4)} "
               f"({vis_err:.1f} mm from truth)")
 
-    # --- PLAN + EXECUTE from the PERCEIVED position ---
-    phases = build_phases(det.position, bin_center(model))
-    fsm = PickPlace(model, data, phases, verbose=verbose)
-
+    fsm = PickPlace(model, data, build_phases(target, bin_center(model)),
+                    verbose=verbose)
     dt = model.opt.timestep
     while not fsm.done:
         t0 = time.perf_counter()
         fsm.step()
         if viewer is not None:
             if not viewer.is_running():
-                return False, vis_err
+                return fsm.abort or MISSED_BIN, vis_err, fsm.abort_phase
             viewer.sync()
             sleep = dt - (time.perf_counter() - t0)
             if sleep > 0:
                 time.sleep(sleep)
 
+    if fsm.abort:
+        return fsm.abort, vis_err, fsm.abort_phase
+
+    ok, _ = in_bin(model, data)
+    return (SUCCESS if ok else MISSED_BIN), vis_err, None
+
+
+def run_trial(model, data, cube_xyz, camera="scene_cam", max_retries=2,
+              vision_noise_mm=0.0, rng=None, verbose=True, viewer=None) -> TrialResult:
+    """Place the cube, then attempt pick-and-place with retries on recoverable failures."""
+    reset_to_home(model, data, key="pick_home")
+    set_cube_pose(model, data, cube_xyz)
+    start = cube_pos(model, data)
+    t_begin = data.time
+
+    outcome, vis_err, phase, attempts = NOT_DETECTED, None, None, 0
+    for i in range(1 + max_retries):
+        attempts = i + 1
+        if i > 0:
+            if verbose:
+                print(f"  retry {i} after {outcome}")
+            reset_arm_keep_cube(model, data)
+        outcome, vis_err, phase = single_attempt(
+            model, data, camera, vision_noise_mm, rng, verbose, viewer)
+        if outcome == SUCCESS or outcome not in RETRYABLE:
+            break
+
     ok, dxy = in_bin(model, data)
+    end = cube_pos(model, data)
     if verbose:
-        c = cube_pos(model, data)
-        print(f"  cube ended at {np.array2string(c, precision=3)} "
-              f"({dxy*1000:.0f} mm from bin centre)  ->  {'IN BIN' if ok else 'MISSED'}")
-        if fsm.failed_ik:
-            # A run can still land the cube after an IK failure, but that is luck,
-            # not planning -- say so rather than reporting a clean success.
-            print(f"  NOTE: IK failed during {', '.join(fsm.failed_ik)} "
-                  f"-- target likely outside the reliable workspace")
-    return ok, vis_err
+        print(f"  -> {outcome.upper()} after {attempts} attempt(s); "
+              f"cube at {np.array2string(end, precision=3)} "
+              f"({dxy*1000:.0f} mm from bin centre)")
+
+    return TrialResult(
+        success=(outcome == SUCCESS), outcome=outcome, attempts=attempts,
+        vision_err_mm=vis_err, cube_start=start, cube_end=end,
+        bin_dist_mm=float(dxy * 1000), sim_time=float(data.time - t_begin),
+        abort_phase=phase)
 
 
 def main():
@@ -244,6 +364,8 @@ def main():
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--camera", default="scene_cam")
     p.add_argument("--headless", action="store_true")
+    p.add_argument("--retries", type=int, default=2,
+                   help="Retries after a recoverable failure (default 2).")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -259,27 +381,27 @@ def main():
         return args.cube
 
     if args.headless:
-        results, errs = [], []
+        results = []
         for i in range(args.trials):
             xyz = sample()
             print(f"\n--- trial {i+1}/{args.trials}  cube at "
                   f"({xyz[0]:.3f}, {xyz[1]:.3f}) ---")
-            ok, e = run_trial(model, data, xyz, args.camera, verbose=True)
-            results.append(ok)
-            if e is not None:
-                errs.append(e)
+            results.append(run_trial(model, data, xyz, args.camera,
+                                     max_retries=args.retries, rng=rng, verbose=True))
         n = len(results)
+        wins = sum(r.success for r in results)
+        errs = [r.vision_err_mm for r in results if r.vision_err_mm is not None]
         print(f"\n{'='*52}")
-        print(f"picked and placed {sum(results)}/{n} "
-              f"({100*sum(results)/n:.0f}%)")
+        print(f"picked and placed {wins}/{n} ({100*wins/n:.0f}%)")
         if errs:
             print(f"mean vision error {np.mean(errs):.1f} mm")
-        print("RESULT:", "PASS" if all(results) else "NEEDS WORK")
+        print("RESULT:", "PASS" if wins == n else "NEEDS WORK")
     else:
         xyz = sample()
         print(f"cube at ({xyz[0]:.3f}, {xyz[1]:.3f}) -- launching viewer (ESC to quit)")
         with mujoco.viewer.launch_passive(model, data) as viewer:
-            run_trial(model, data, xyz, args.camera, verbose=True, viewer=viewer)
+            run_trial(model, data, xyz, args.camera, max_retries=args.retries,
+                      rng=rng, verbose=True, viewer=viewer)
             print("\nsequence complete -- viewer stays open, ESC to quit")
             while viewer.is_running():
                 viewer.sync()

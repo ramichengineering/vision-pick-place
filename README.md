@@ -13,7 +13,10 @@ Vision-guided pick and place with a simulated Franka Panda arm in MuJoCo.
   by the arm using vision alone. *(done)*
 - **Days 7–8 — Full pick and place.** State machine chaining approach → descend
   → grasp → lift → transport → release, with minimum-jerk trajectories between
-  waypoints. 12/12 randomized trials land the cube in the bin. *(current)*
+  waypoints. 12/12 randomized trials land the cube in the bin. *(done)*
+- **Days 9–10 — Robustness and measurement.** Randomized placement, typed
+  failure detection with retry-on-recoverable, and a logged 50-trial benchmark.
+  **98% success (49/50)** over the full workspace. *(current)*
 
 ## Run
 ```bash
@@ -42,6 +45,40 @@ python src/pick_place.py --trials 12 --headless # reliability check
 ```
 Reliable cube placements: `x` 0.30–0.80 m, `y` −0.25 to +0.45 m.
 
+```bash
+# Days 9-10 — Robustness benchmark
+python src/benchmark.py --trials 50               # full workspace, with retries
+python src/benchmark.py --trials 50 --zone safe   # interior regression check
+python src/benchmark.py --trials 50 --retries 0   # what retries are worth
+python src/benchmark.py --noise-sweep             # perception-error tolerance
+```
+Per-trial CSVs land in `results/`.
+
+## Measured results
+50 randomized trials per row, seed 42.
+
+| Configuration | Success | Notes |
+|---|---|---|
+| full workspace, 2 retries | **49/50 (98%)** | 1 × `ik_failed` at (0.785, +0.372), 0.87 m out — past reach |
+| full workspace, 0 retries | 48/50 (96%) | retries recovered a `grasp_failed` next to the bin |
+| safe interior, 2 retries | 50/50 (100%) | mean placement 0.8 mm from bin centre |
+
+Vision error is 2.3 mm mean / 4.4 mm max; successful placements land 2.0 mm mean
+from the bin centre.
+
+**Perception-error tolerance** (12 trials/level, safe zone):
+
+| added noise (mm) | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 40 |
+|---|---|---|---|---|---|---|---|---|
+| no retries | 100% | 100% | 100% | 100% | 50% | 33% | 25% | 17% |
+| 2 retries | 100% | 100% | 100% | 100% | 92% | 75% | 67% | 42% |
+
+The cliff between 15 and 20 mm is geometric, not tuning: the gripper opens to
+40 mm per side against a 25 mm cube half-width, leaving exactly **15 mm of finger
+clearance**. Beyond that a finger strikes the cube instead of passing around it.
+Retries roughly double the success rate in the marginal band, because each attempt
+re-perceives and is an independent shot.
+
 ## Layout
 | File | Purpose |
 |------|---------|
@@ -54,7 +91,8 @@ Reliable cube placements: `x` 0.30–0.80 m, `y` −0.25 to +0.45 m.
 | `src/perception.py` | Colour segmentation + depth back-projection -> world xyz |
 | `src/perception_test.py` | Scores vision estimates against ground truth |
 | `src/see_and_reach.py` | Full loop: see the cube -> IK -> reach it |
-| `src/pick_place.py` | Pick-and-place state machine (perception + IK + PD) |
+| `src/pick_place.py` | Pick-and-place state machine + failure detection/retry |
+| `src/benchmark.py` | Randomized trial campaigns, CSV logs, success-rate stats |
 | `src/debug_render.py` | Save RGB/mask PNGs from each camera |
 | `src/inspect_model.py` | Print joints / actuators / dimensions |
 | `src/inspect_gripper.py` | Measure fingertip geometry and the true grasp point |
