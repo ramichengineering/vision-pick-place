@@ -25,8 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
-from pick_place import (DROPPED, GRASP_FAILED, IK_FAILED, MISSED_BIN,
-                        NOT_DETECTED, SUCCESS, run_trial)
+from pick_place import (DEFAULT_SPEED, DROPPED, GRASP_FAILED, IK_FAILED,
+                        MISSED_BIN, NOT_DETECTED, SUCCESS, run_trial)
 from robot import load_pick_scene
 
 ZONES = {
@@ -44,7 +44,7 @@ def sample_cube(rng, zone):
 
 
 def run_campaign(model, data, n, zone, retries, noise_mm, rng, quiet=True,
-                 label=""):
+                 label="", speed=DEFAULT_SPEED):
     """Run n randomized trials; return the list of TrialResult."""
     results = []
     t_wall = time.perf_counter()
@@ -53,7 +53,8 @@ def run_campaign(model, data, n, zone, retries, noise_mm, rng, quiet=True,
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             r = run_trial(model, data, xyz, max_retries=retries,
-                          vision_noise_mm=noise_mm, rng=rng, verbose=True)
+                          vision_noise_mm=noise_mm, rng=rng, verbose=True,
+                          speed=speed)
         results.append(r)
         if not quiet:
             flag = "ok " if r.success else "FAIL"
@@ -165,11 +166,27 @@ def main():
     p.add_argument("--noise-sweep", action="store_true")
     p.add_argument("--per-level", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--speed", type=float, default=DEFAULT_SPEED)
+    p.add_argument("--speed-sweep", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--csv", default=None)
     args = p.parse_args()
 
     model, data = load_pick_scene()
+
+    if args.speed_sweep:
+        print(f"speed sweep ({args.trials} trials/level, zone={args.zone}, "
+              f"retries={args.retries})\n")
+        print(f"{'speed':>6} {'cycle_s':>8} {'success':>9} {'rate':>7}")
+        for sp in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]:
+            rng = np.random.default_rng(args.seed)
+            res, _ = run_campaign(model, data, args.trials, args.zone,
+                                  args.retries, args.noise, rng, speed=sp)
+            wins = sum(r.success for r in res)
+            cyc = np.mean([r.sim_time for r in res if r.success]) if wins else float('nan')
+            print(f"{sp:>6.1f} {cyc:>8.2f} {wins:>4}/{args.trials:<4} "
+                  f"{100*wins/args.trials:>6.0f}%")
+        return
 
     if args.noise_sweep:
         noise_sweep(model, data, args.per_level, args.zone, args.retries, args.seed)
@@ -181,7 +198,7 @@ def main():
           f"retries={args.retries} | noise={args.noise} mm\n")
     results, elapsed = run_campaign(model, data, args.trials, args.zone,
                                     args.retries, args.noise, rng,
-                                    quiet=args.quiet)
+                                    quiet=args.quiet, speed=args.speed)
     rate = summarize(results, elapsed,
                      f"zone={args.zone}  retries={args.retries}  "
                      f"noise={args.noise}mm")

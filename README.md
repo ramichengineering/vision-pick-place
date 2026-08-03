@@ -17,10 +17,11 @@ Vision-guided pick and place with a simulated Franka Panda arm in MuJoCo.
 - **Days 9–10 — Analysis** Randomized placement, typed
   failure detection with retry-on-recoverable, logged benchmark.
   **98% success (49/50)** over the full workspace. 
+- **Gain tuning** Inertia-scaled PD gains replacing the hand-picked ones, found
+  by sweeping a 2-parameter (wn, zeta) space. Cycle time **14.7 s → 5.2 s
+  (2.8× faster)** with reliability unchanged.
 
 ## Things to do in the future:
-- **Optimize PD Controller** possibly do this algorithmically. see how fast
-  I can get the robot to smoothly run
 - **Additional Testing/Analysis** tests with more retries. try to optimize
   success rate vs compute power/time
 - **Add more randomness to testing** current tests had all the cubes aligned
@@ -68,8 +69,65 @@ python src/benchmark.py --trials 50               # full workspace, with retries
 python src/benchmark.py --trials 50 --zone safe   # interior regression check
 python src/benchmark.py --trials 50 --retries 0   # what retries are worth
 python src/benchmark.py --noise-sweep             # perception-error tolerance
+python src/benchmark.py --speed-sweep             # cycle time vs success rate
 ```
 Per-trial CSVs land in `results/`.
+
+```bash
+# Gain tuning
+python src/analyze_gains.py          # inertia, damping ratio, torque headroom
+python src/tune_gains.py             # sweep wn; compares against the old gains
+python src/tune_gains.py --zeta-sweep --wn 30
+python src/tune_gains.py --speed     # how short a move stays smooth
+python src/pick_place.py --speed 1.0 # reproduce the original Day 7-8 timings
+```
+
+## Gain tuning
+Gains are no longer 14 hand-picked numbers. Each joint is scaled by its own
+effective inertia `M_i`, which leaves two physically meaningful knobs:
+
+```
+kp_i = wn^2 * M_i            wn   = natural frequency, same for every joint
+kd_i = 2 * zeta * wn * M_i   zeta = damping ratio
+```
+
+Defaults are `wn = 30 rad/s`, `zeta = 0.8`. Versus the old gains, on the same
+pick-and-place path:
+
+| metric | hand-picked | tuned |
+|---|---|---|
+| trajectory tracking lag | 0.177 rad | **0.071 rad** |
+| trajectory overshoot | 2.48% | **1.39%** |
+| step-response settling | 1.05 s | **0.32 s** |
+| peak torque used | 43% | 43% |
+
+**What actually limits the gains** is not motor torque (peak usage is 43%) and
+not the classic explicit-integration limit (kp could go ~100× higher). It is a
+discrete-time instability in the *damping* term: because the damper acts on the
+previous step's velocity, too large a `kd` makes the correction overshoot and
+flip sign every step — a 250 Hz ring, exactly Nyquist for the 2 ms timestep.
+The measured boundary is `zeta * wn <~ 27`, and it is sharp: at 27.2 the arm
+tracks a smooth trajectory perfectly yet chatters violently the moment anything
+disturbs it. The defaults sit at 24, verified chatter-free over 60 random poses.
+
+Note that `zeta` is chosen for margin, not tracking. At equal `zeta*wn` the whole
+family — (40, 0.6), (34, 0.7), (30, 0.8), (24, 1.0) — scores the same 96–98% on
+the benchmark, so the task cannot pick a winner. What separates them is response
+to inputs the trajectory generator never produces: a step command overshoots 31%
+at `zeta = 0.6` but only 3.9% at `zeta = 0.8`.
+
+**Speed.** Tighter tracking buys shorter phase durations. `--speed` divides every
+duration; 150 trials per level (3 seeds × 50), full workspace:
+
+| speed | 1.0 | 2.0 | 2.5 | **3.0** | 3.5 | 4.0 |
+|---|---|---|---|---|---|---|
+| cycle time (s) | 14.73 | 7.43 | 6.09 | **5.23** | 4.61 | 4.15 |
+| success | 97.3% | 96.7% | 96.0% | **96.7%** | 94.0% | 92.0% |
+
+1.0×–3.0× are statistically indistinguishable, so **3.0 is the default**: a 2.8×
+faster cycle for no measurable reliability cost. Past it the extra failures are
+mostly `ik_failed`, because each phase seeds IK from the *current* pose and a
+hurried arm has not settled when the next phase begins.
 
 ## Measured results
 50 randomized trials per row, seed 42.
@@ -77,18 +135,19 @@ Per-trial CSVs land in `results/`.
 | Configuration | Success | Notes |
 |---|---|---|
 | full workspace, 2 retries | **49/50 (98%)** | 1 × `ik_failed` at (0.785, +0.372), 0.87 m out, past reach |
-| full workspace, 0 retries | 48/50 (96%) | retries recovered a `grasp_failed` next to the bin |
-| safe interior, 2 retries | 50/50 (100%) | mean placement 0.8 mm from bin centre |
+| full workspace, 0 retries | 47/50 (94%) | retries recover 3 of the 4 non-reach failures |
+| safe interior, 2 retries | 50/50 (100%) | mean placement 2.8 mm from bin centre |
 
-Vision error is 2.3 mm mean / 4.4 mm max; successful placements land 2.0 mm mean
-from the bin centre.
+Vision error is 2.3 mm mean / 4.4 mm max; successful placements land 4.6 mm mean
+from the bin centre. (Measured at the tuned gains and the default 3.0x speed;
+`--speed 1.0` places tighter, ~2 mm, at 2.8x the cycle time.)
 
 **Perception-error tolerance** (12 trials/level, safe zone):
 
 | added noise (mm) | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 40 |
 |---|---|---|---|---|---|---|---|---|
-| no retries | 100% | 100% | 100% | 100% | 50% | 33% | 25% | 17% |
-| 2 retries | 100% | 100% | 100% | 100% | 92% | 75% | 67% | 42% |
+| no retries | 100% | 100% | 100% | 100% | 92% | 50% | 25% | 17% |
+| 2 retries | 100% | 100% | 100% | 100% | 92% | 92% | 83% | 58% |
 
 The huge jump between 15 and 20 mm is caused by geometry and not tuning.
 the gripper opens to 40 mm per side against a 25 mm cube half-width. 
@@ -115,6 +174,9 @@ computing time and power.*
 | `src/see_and_reach.py` | Full loop: see the cube -> IK -> reach it |
 | `src/pick_place.py` | Pick-and-place state machine + failure detection/retry |
 | `src/benchmark.py` | Randomized trial campaigns, CSV logs, success-rate stats |
+| `src/pd_controller.py` | Inertia-scaled PD gains (see Gain tuning) |
+| `src/tune_gains.py` | Gain/speed sweeps against smoothness criteria |
+| `src/analyze_gains.py` | Inertia, damping ratio, torque headroom per joint |
 | `src/debug_render.py` | Save RGB/mask PNGs from each camera |
 | `src/inspect_model.py` | Print joints / actuators / dimensions |
 | `src/inspect_gripper.py` | Measure fingertip geometry and the true grasp point |

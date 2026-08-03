@@ -27,6 +27,7 @@ from robot import ARM, ARM_DOF, home_qpos, load_pick_scene, reset_to_home
 # Stand off above the cube rather than driving into it (Day 7 does the grasp).
 APPROACH_HEIGHT = 0.10
 SETTLE_SECONDS = 4.0
+MOVE_TIME = 1.5      # seconds to ease from home to the reach target
 
 
 def parse_args():
@@ -72,14 +73,29 @@ def plan(model, data, cube_xyz):
 
 def drive_headless(model, data, q_des):
     pd = JointPD()
-    for _ in range(int(SETTLE_SECONDS / model.opt.timestep)):
-        data.ctrl[ARM] = pd(model, data, q_des)
+    q0 = data.qpos[ARM].copy()
+    for k in range(int(SETTLE_SECONDS / model.opt.timestep)):
+        data.ctrl[ARM] = pd(model, data, ramp(q0, q_des, k * model.opt.timestep))
         mujoco.mj_step(model, data)
+
+
+def ramp(q0, q_goal, t):
+    """Ease from q0 to q_goal over MOVE_TIME along a minimum-jerk profile.
+
+    Commanding q_goal as a step works, but sends the arm along whatever fast
+    joint-space path the PD picks -- which with stiff gains sweeps the gripper
+    through the cube and knocks it aside before the reach is scored. Every other
+    motion in this project is interpolated; this one should be too.
+    """
+    s = np.clip(t / MOVE_TIME, 0.0, 1.0)
+    return q0 + (10 * s**3 - 15 * s**4 + 6 * s**5) * (q_goal - q0)
 
 
 def drive_viewer(model, data, q_des, goal):
     pd = JointPD()
     dt = model.opt.timestep
+    q0 = data.qpos[ARM].copy()
+    t = 0.0
     print("[sim]    launching viewer (ESC to quit)")
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.user_scn.ngeom = 1
@@ -89,8 +105,9 @@ def drive_viewer(model, data, q_des, goal):
             rgba=[0, 1, 0, 0.5])
         while viewer.is_running():
             t0 = time.perf_counter()
-            data.ctrl[ARM] = pd(model, data, q_des)
+            data.ctrl[ARM] = pd(model, data, ramp(q0, q_des, t))
             mujoco.mj_step(model, data)
+            t += dt
             viewer.sync()
             s = dt - (time.perf_counter() - t0)
             if s > 0:

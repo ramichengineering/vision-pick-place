@@ -101,20 +101,63 @@ def bin_center(model) -> np.ndarray:
     return model.body_pos[bid].copy()
 
 
-def build_phases(cube_xyz, bin_xyz) -> list[Phase]:
+# The gripper takes ~0.38 s to travel its full stroke (measured). Arm phases can
+# be sped up as far as the controller allows, but the gripper dwells cannot go
+# below the hardware's own settling time or we would lift before it has closed.
+GRIPPER_DWELL = 0.45
+
+# Validated operating speed, measured over 150 trials per level (3 seeds x 50):
+#
+#   speed   cycle    success       speed   cycle    success
+#     1.0   14.73 s   97.3%          3.0    5.23 s   96.7%
+#     2.0    7.43 s   96.7%          3.5    4.61 s   94.0%
+#     2.5    6.09 s   96.0%          4.0    4.15 s   92.0%
+#
+# 1.0x-3.0x are statistically indistinguishable, so 3.0 is the knee: a 2.8x
+# faster cycle for no measurable reliability cost. Past it the failures are
+# mostly ik_failed, because each phase seeds IK from the *current* pose and a
+# hurried arm has not settled when the next phase starts. Set --speed 1.0 to
+# reproduce the Day 7-8 timings.
+DEFAULT_SPEED = 3.0
+
+# Nominal timings at speed=1.0, tuned by hand back when the gains were soft.
+_NOMINAL = [
+    # name,        goal,        grip,        move, hold, hold_required
+    ("SETTLE",    None,         GRIP_OPEN,   0.0,  0.5,  False),
+    ("APPROACH",  "pre_grasp",  GRIP_OPEN,   2.0,  0.4,  False),
+    ("DESCEND",   "grasp",      GRIP_OPEN,   1.6,  0.4,  False),
+    ("CLOSE",     "grasp",      GRIP_CLOSED, 0.1,  1.0,  False),
+    ("LIFT",      "lift",       GRIP_CLOSED, 1.6,  0.3,  True),
+    ("TRANSPORT", "over_bin",   GRIP_CLOSED, 2.5,  0.4,  True),
+    ("LOWER",     "release",    GRIP_CLOSED, 1.2,  0.3,  True),
+    ("RELEASE",   "release",    GRIP_OPEN,   0.1,  0.8,  False),
+    ("RETREAT",   "over_bin",   GRIP_OPEN,   1.2,  0.3,  False),
+]
+
+
+def build_phases(cube_xyz, bin_xyz, speed=DEFAULT_SPEED) -> list[Phase]:
+    """Phase list for this cube/bin pair. `speed` divides every duration.
+
+    speed=2.0 runs the whole sequence twice as fast. How far this can go is set
+    by the controller's tracking: see tune_gains.py.
+    """
     cx, cy, cz = cube_xyz
     bx, by, _ = bin_xyz
-    return [
-        Phase("SETTLE",    None,                            GRIP_OPEN,   0.0, 0.5),
-        Phase("APPROACH",  np.array([cx, cy, cz + APPROACH_H]), GRIP_OPEN,   2.0, 0.4),
-        Phase("DESCEND",   np.array([cx, cy, cz]),              GRIP_OPEN,   1.6, 0.4),
-        Phase("CLOSE",     np.array([cx, cy, cz]),              GRIP_CLOSED, 0.1, 1.0),
-        Phase("LIFT",      np.array([cx, cy, cz + LIFT_H]),     GRIP_CLOSED, 1.6, 0.3, True),
-        Phase("TRANSPORT", np.array([bx, by, BIN_HOVER_H]),     GRIP_CLOSED, 2.5, 0.4, True),
-        Phase("LOWER",     np.array([bx, by, BIN_RELEASE_H]),   GRIP_CLOSED, 1.2, 0.3, True),
-        Phase("RELEASE",   np.array([bx, by, BIN_RELEASE_H]),   GRIP_OPEN,   0.1, 0.8),
-        Phase("RETREAT",   np.array([bx, by, BIN_HOVER_H]),     GRIP_OPEN,   1.2, 0.3),
-    ]
+    goals = {
+        "pre_grasp": np.array([cx, cy, cz + APPROACH_H]),
+        "grasp":     np.array([cx, cy, cz]),
+        "lift":      np.array([cx, cy, cz + LIFT_H]),
+        "over_bin":  np.array([bx, by, BIN_HOVER_H]),
+        "release":   np.array([bx, by, BIN_RELEASE_H]),
+    }
+    phases = []
+    for name, key, grip, move, hold, needs_hold in _NOMINAL:
+        move, hold = move / speed, hold / speed
+        if name in ("CLOSE", "RELEASE"):
+            hold = max(hold, GRIPPER_DWELL)      # hardware floor, not negotiable
+        phases.append(Phase(name, None if key is None else goals[key],
+                            grip, move, hold, needs_hold))
+    return phases
 
 
 class PickPlace:
@@ -277,7 +320,7 @@ RETRYABLE = (GRASP_FAILED, DROPPED, MISSED_BIN)
 
 
 def single_attempt(model, data, camera="scene_cam", vision_noise_mm=0.0, rng=None,
-                   verbose=True, viewer=None):
+                   verbose=True, viewer=None, speed=DEFAULT_SPEED):
     """One attempt, starting from wherever the cube currently is.
 
     Returns (outcome, vision_err_mm, abort_phase).
@@ -301,7 +344,7 @@ def single_attempt(model, data, camera="scene_cam", vision_noise_mm=0.0, rng=Non
         print(f"    [vision] {np.array2string(det.position, precision=4)} "
               f"({vis_err:.1f} mm from truth)")
 
-    fsm = PickPlace(model, data, build_phases(target, bin_center(model)),
+    fsm = PickPlace(model, data, build_phases(target, bin_center(model), speed),
                     verbose=verbose)
     dt = model.opt.timestep
     while not fsm.done:
@@ -323,7 +366,8 @@ def single_attempt(model, data, camera="scene_cam", vision_noise_mm=0.0, rng=Non
 
 
 def run_trial(model, data, cube_xyz, camera="scene_cam", max_retries=2,
-              vision_noise_mm=0.0, rng=None, verbose=True, viewer=None) -> TrialResult:
+              vision_noise_mm=0.0, rng=None, verbose=True, viewer=None,
+              speed=DEFAULT_SPEED) -> TrialResult:
     """Place the cube, then attempt pick-and-place with retries on recoverable failures."""
     reset_to_home(model, data, key="pick_home")
     set_cube_pose(model, data, cube_xyz)
@@ -338,7 +382,7 @@ def run_trial(model, data, cube_xyz, camera="scene_cam", max_retries=2,
                 print(f"  retry {i} after {outcome}")
             reset_arm_keep_cube(model, data)
         outcome, vis_err, phase = single_attempt(
-            model, data, camera, vision_noise_mm, rng, verbose, viewer)
+            model, data, camera, vision_noise_mm, rng, verbose, viewer, speed)
         if outcome == SUCCESS or outcome not in RETRYABLE:
             break
 
@@ -366,6 +410,8 @@ def main():
     p.add_argument("--headless", action="store_true")
     p.add_argument("--retries", type=int, default=2,
                    help="Retries after a recoverable failure (default 2).")
+    p.add_argument("--speed", type=float, default=DEFAULT_SPEED,
+                   help="Divides every phase duration; 2.0 = twice as fast.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -387,7 +433,8 @@ def main():
             print(f"\n--- trial {i+1}/{args.trials}  cube at "
                   f"({xyz[0]:.3f}, {xyz[1]:.3f}) ---")
             results.append(run_trial(model, data, xyz, args.camera,
-                                     max_retries=args.retries, rng=rng, verbose=True))
+                                     max_retries=args.retries, rng=rng, verbose=True,
+                                     speed=args.speed))
         n = len(results)
         wins = sum(r.success for r in results)
         errs = [r.vision_err_mm for r in results if r.vision_err_mm is not None]
@@ -401,7 +448,7 @@ def main():
         print(f"cube at ({xyz[0]:.3f}, {xyz[1]:.3f}) -- launching viewer (ESC to quit)")
         with mujoco.viewer.launch_passive(model, data) as viewer:
             run_trial(model, data, xyz, args.camera, max_retries=args.retries,
-                      rng=rng, verbose=True, viewer=viewer)
+                      rng=rng, verbose=True, viewer=viewer, speed=args.speed)
             print("\nsequence complete -- viewer stays open, ESC to quit")
             while viewer.is_running():
                 viewer.sync()
